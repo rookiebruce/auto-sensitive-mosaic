@@ -43,7 +43,7 @@ def center_distance(a, b):
     return ((acx - bcx) ** 2 + (acy - bcy) ** 2) ** 0.5 / scale
 
 
-def update_tracks(tracks, detections, hold_frames=5, alpha=0.82):
+def update_tracks(tracks, detections, hold_frames=8, alpha=0.80):
     for track in tracks:
         track["matched"] = False
 
@@ -86,7 +86,7 @@ def update_tracks(tracks, detections, hold_frames=5, alpha=0.82):
     return active
 
 
-def merge_nudenet_detections(detector, frame, threshold=0.18):
+def merge_nudenet_detections(detector, frame, threshold=0.10):
     detections = []
     for candidate, flipped in ((frame, False), (cv2.flip(frame, 1), True)):
         for detection in detector.detect(candidate):
@@ -165,9 +165,71 @@ def pose_guardrails(model, frame):
                 "person": [x1, y1, person_width, person_height],
                 "shoulder_line": shoulder_line,
                 "hip_line": hip_line,
+                "keypoint": keypoint,
             }
         )
     return people_bounds
+
+
+def pose_safety_detections(people_bounds):
+    """Add small torso/pelvis safety boxes when the detector misses.
+
+    These boxes intentionally do not cover the face: the upper fallback starts
+    below the shoulder line, and the lower fallback is anchored around the hip
+    line. They trade some extra torso/pelvis censorship for fewer exposed
+    frames.
+    """
+    detections = []
+    for bounds in people_bounds:
+        px, py, pw, ph = [float(value) for value in bounds["person"]]
+        shoulder_line = float(bounds["shoulder_line"])
+        hip_line = float(bounds["hip_line"])
+        keypoint = bounds.get("keypoint")
+
+        torso_top = max(py + ph * 0.20, shoulder_line + ph * 0.04)
+        torso_bottom = min(hip_line - ph * 0.04, py + ph * 0.58)
+        if torso_bottom > torso_top:
+            if keypoint is not None and keypoint[5][2] > 0.12 and keypoint[6][2] > 0.12:
+                left_shoulder, right_shoulder = keypoint[5], keypoint[6]
+                shoulder_x1 = min(left_shoulder[0], right_shoulder[0])
+                shoulder_x2 = max(left_shoulder[0], right_shoulder[0])
+                shoulder_width = max(shoulder_x2 - shoulder_x1, pw * 0.35)
+                x1 = max(px, shoulder_x1 - shoulder_width * 0.35)
+                x2 = min(px + pw, shoulder_x2 + shoulder_width * 0.35)
+            else:
+                x1 = px + pw * 0.12
+                x2 = px + pw * 0.88
+            if x2 > x1:
+                detections.append(
+                    {
+                        "class": "FEMALE_BREAST_EXPOSED",
+                        "score": 0.11,
+                        "box": [x1, torso_top, x2 - x1, torso_bottom - torso_top],
+                    }
+                )
+
+        pelvis_top = max(py + ph * 0.50, hip_line - ph * 0.10)
+        pelvis_bottom = min(py + ph * 0.94, hip_line + ph * 0.30)
+        if pelvis_bottom > pelvis_top:
+            if keypoint is not None and keypoint[11][2] > 0.10 and keypoint[12][2] > 0.10:
+                left_hip, right_hip = keypoint[11], keypoint[12]
+                hip_x1 = min(left_hip[0], right_hip[0])
+                hip_x2 = max(left_hip[0], right_hip[0])
+                hip_width = max(hip_x2 - hip_x1, pw * 0.28)
+                x1 = max(px, hip_x1 - hip_width * 0.55)
+                x2 = min(px + pw, hip_x2 + hip_width * 0.55)
+            else:
+                x1 = px + pw * 0.18
+                x2 = px + pw * 0.82
+            if x2 > x1:
+                detections.append(
+                    {
+                        "class": "FEMALE_GENITALIA_EXPOSED",
+                        "score": 0.11,
+                        "box": [x1, pelvis_top, x2 - x1, pelvis_bottom - pelvis_top],
+                    }
+                )
+    return detections
 
 
 def constrain_sensitive_box(box, class_name, people_bounds):
@@ -204,7 +266,7 @@ def constrain_sensitive_box(box, class_name, people_bounds):
     return [x1, y1, x2 - x1, y2 - y1]
 
 
-def mosaic_region(frame, box, block_size=28, padding_ratio=0.06):
+def mosaic_region(frame, box, block_size=34, padding_ratio=0.10):
     frame_height, frame_width = frame.shape[:2]
     x, y, width, height = box
     padding_x = max(8, int(width * padding_ratio))
@@ -287,8 +349,9 @@ def process_video(input_path, output_path, ffmpeg_path, pose_model_path):
                 break
 
             detections = merge_nudenet_detections(detector, frame)
-            tracks = update_tracks(tracks, detections)
             guardrails = pose_guardrails(pose_model, frame)
+            detections.extend(pose_safety_detections(guardrails))
+            tracks = update_tracks(tracks, detections)
             for track in tracks:
                 box = constrain_sensitive_box(
                     track["box"], track["class"], guardrails
