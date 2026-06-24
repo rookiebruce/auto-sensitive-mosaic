@@ -43,7 +43,7 @@ def center_distance(a, b):
     return ((acx - bcx) ** 2 + (acy - bcy) ** 2) ** 0.5 / scale
 
 
-def update_tracks(tracks, detections, hold_frames=18, alpha=0.72):
+def update_tracks(tracks, detections, hold_frames=5, alpha=0.82):
     for track in tracks:
         track["matched"] = False
 
@@ -86,7 +86,7 @@ def update_tracks(tracks, detections, hold_frames=18, alpha=0.72):
     return active
 
 
-def merge_nudenet_detections(detector, frame, threshold=0.10):
+def merge_nudenet_detections(detector, frame, threshold=0.18):
     detections = []
     for candidate, flipped in ((frame, False), (cv2.flip(frame, 1), True)):
         for detection in detector.detect(candidate):
@@ -120,7 +120,12 @@ def box_from_points(points, frame_width, frame_height, expand_x, expand_y):
     return [x1, y1, x2 - x1, y2 - y1]
 
 
-def pose_fallback_boxes(model, frame):
+def pose_guardrails(model, frame):
+    """Return per-person bounds used to keep mosaics away from faces.
+
+    Pose results are guardrails only in precision mode. They do not create
+    censorship regions by themselves.
+    """
     frame_height, frame_width = frame.shape[:2]
     result = model.predict(
         frame, imgsz=512, conf=0.12, iou=0.6, verbose=False
@@ -134,7 +139,7 @@ def pose_fallback_boxes(model, frame):
         if result.keypoints is not None
         else []
     )
-    fallback_boxes = []
+    people_bounds = []
 
     for index, person in enumerate(people):
         x1, y1, x2, y2 = person
@@ -143,72 +148,63 @@ def pose_fallback_boxes(model, frame):
             continue
 
         keypoint = keypoints[index] if index < len(keypoints) else None
-        used_landmarks = False
+        shoulder_line = y1 + person_height * 0.18
+        hip_line = y1 + person_height * 0.62
         if keypoint is not None:
             left_shoulder, right_shoulder = keypoint[5], keypoint[6]
             left_hip, right_hip = keypoint[11], keypoint[12]
-            landmarks_visible = (
-                left_shoulder[2] > 0.12
-                and right_shoulder[2] > 0.12
-                and left_hip[2] > 0.10
-                and right_hip[2] > 0.10
-            )
-            if landmarks_visible:
-                shoulder_mid = (left_shoulder[:2] + right_shoulder[:2]) / 2
-                hip_mid = (left_hip[:2] + right_hip[:2]) / 2
-                torso = hip_mid - shoulder_mid
-
-                fallback_boxes.append(
-                    box_from_points(
-                        [
-                            left_shoulder[:2],
-                            right_shoulder[:2],
-                            left_shoulder[:2] + torso * 0.58,
-                            right_shoulder[:2] + torso * 0.58,
-                        ],
-                        frame_width,
-                        frame_height,
-                        0.22,
-                        0.28,
-                    )
+            if left_shoulder[2] > 0.15 and right_shoulder[2] > 0.15:
+                shoulder_line = float(
+                    min(left_shoulder[1], right_shoulder[1])
                 )
-                fallback_boxes.append(
-                    box_from_points(
-                        [
-                            left_shoulder[:2] + torso * 0.70,
-                            right_shoulder[:2] + torso * 0.70,
-                            left_hip[:2] + torso * 0.28,
-                            right_hip[:2] + torso * 0.28,
-                        ],
-                        frame_width,
-                        frame_height,
-                        0.28,
-                        0.28,
-                    )
-                )
-                used_landmarks = True
+            if left_hip[2] > 0.12 and right_hip[2] > 0.12:
+                hip_line = float((left_hip[1] + right_hip[1]) / 2)
 
-        if not used_landmarks:
-            fallback_boxes.extend(
-                [
-                    [
-                        x1 + person_width * 0.10,
-                        y1 + person_height * 0.16,
-                        person_width * 0.80,
-                        person_height * 0.40,
-                    ],
-                    [
-                        x1 + person_width * 0.10,
-                        y1 + person_height * 0.48,
-                        person_width * 0.80,
-                        person_height * 0.40,
-                    ],
-                ]
-            )
-    return fallback_boxes
+        people_bounds.append(
+            {
+                "person": [x1, y1, person_width, person_height],
+                "shoulder_line": shoulder_line,
+                "hip_line": hip_line,
+            }
+        )
+    return people_bounds
 
 
-def mosaic_region(frame, box, block_size=40, padding_ratio=0.16):
+def constrain_sensitive_box(box, class_name, people_bounds):
+    """Clip a detected sensitive box to plausible torso/pelvis limits."""
+    x, y, width, height = [float(value) for value in box]
+    center_x, center_y = x + width / 2, y + height / 2
+    matching_people = []
+    for bounds in people_bounds:
+        px, py, pw, ph = bounds["person"]
+        if px <= center_x <= px + pw and py <= center_y <= py + ph:
+            matching_people.append(bounds)
+    if not matching_people:
+        return [x, y, width, height]
+
+    bounds = min(
+        matching_people,
+        key=lambda item: item["person"][2] * item["person"][3],
+    )
+    px, py, pw, ph = bounds["person"]
+
+    if "BREAST" in class_name:
+        min_y = bounds["shoulder_line"] + ph * 0.02
+        max_y = bounds["hip_line"] - ph * 0.06
+    else:
+        min_y = bounds["hip_line"] - ph * 0.10
+        max_y = py + ph * 0.96
+
+    x1 = max(x, px)
+    y1 = max(y, min_y)
+    x2 = min(x + width, px + pw)
+    y2 = min(y + height, max_y)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [x1, y1, x2 - x1, y2 - y1]
+
+
+def mosaic_region(frame, box, block_size=28, padding_ratio=0.06):
     frame_height, frame_width = frame.shape[:2]
     x, y, width, height = box
     padding_x = max(8, int(width * padding_ratio))
@@ -292,10 +288,13 @@ def process_video(input_path, output_path, ffmpeg_path, pose_model_path):
 
             detections = merge_nudenet_detections(detector, frame)
             tracks = update_tracks(tracks, detections)
-            boxes = [track["box"] for track in tracks]
-            boxes.extend(pose_fallback_boxes(pose_model, frame))
-            for box in boxes:
-                mosaic_region(frame, box)
+            guardrails = pose_guardrails(pose_model, frame)
+            for track in tracks:
+                box = constrain_sensitive_box(
+                    track["box"], track["class"], guardrails
+                )
+                if box is not None:
+                    mosaic_region(frame, box)
 
             encoder.stdin.write(frame.tobytes())
             frame_index += 1
