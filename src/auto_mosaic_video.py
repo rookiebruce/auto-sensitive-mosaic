@@ -185,6 +185,7 @@ def pose_safety_detections(people_bounds):
         shoulder_line = float(bounds["shoulder_line"])
         hip_line = float(bounds["hip_line"])
         keypoint = bounds.get("keypoint")
+        fallback_added = False
 
         torso_top = max(py + ph * 0.20, shoulder_line + ph * 0.04)
         torso_bottom = min(hip_line - ph * 0.04, py + ph * 0.58)
@@ -202,9 +203,21 @@ def pose_safety_detections(people_bounds):
             if x2 > x1:
                 detections.append(
                     {
-                        "class": "FEMALE_BREAST_EXPOSED",
+                        "class": "BREAST_FALLBACK",
                         "score": 0.11,
                         "box": [x1, torso_top, x2 - x1, torso_bottom - torso_top],
+                    }
+                )
+                fallback_added = True
+
+        if keypoint is not None:
+            extra_box = abnormal_pose_breast_box(keypoint, px, py, pw, ph)
+            if extra_box is not None:
+                detections.append(
+                    {
+                        "class": "BREAST_FALLBACK",
+                        "score": 0.12 if fallback_added else 0.13,
+                        "box": extra_box,
                     }
                 )
 
@@ -232,9 +245,112 @@ def pose_safety_detections(people_bounds):
     return detections
 
 
+def visible_points(keypoint, indexes, threshold=0.10):
+    points = []
+    for index in indexes:
+        point = keypoint[index]
+        if point[2] > threshold:
+            points.append((float(point[0]), float(point[1])))
+    return points
+
+
+def abnormal_pose_breast_box(keypoint, px, py, pw, ph):
+    """Return a higher chest box for lying/back-arched pose failures."""
+    shoulders = visible_points(keypoint, [5, 6], 0.12)
+    hips = visible_points(keypoint, [11, 12], 0.10)
+    if len(shoulders) < 1:
+        return None
+
+    torso_points = shoulders + hips
+    xs = [point[0] for point in torso_points]
+    ys = [point[1] for point in torso_points]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    shoulder_mid = (
+        sum(point[0] for point in shoulders) / len(shoulders),
+        sum(point[1] for point in shoulders) / len(shoulders),
+    )
+
+    has_hips = len(hips) >= 1
+    if has_hips:
+        hip_mid = (
+            sum(point[0] for point in hips) / len(hips),
+            sum(point[1] for point in hips) / len(hips),
+        )
+        torso_dx = abs(shoulder_mid[0] - hip_mid[0])
+        torso_dy = abs(shoulder_mid[1] - hip_mid[1])
+    else:
+        hip_mid = None
+        torso_dx = 0
+        torso_dy = 0
+
+    shoulders_low = shoulder_mid[1] > py + ph * 0.42
+    torso_flat = has_hips and torso_dy < ph * 0.18
+    torso_horizontal = has_hips and torso_dx > max(80, torso_dy * 1.25)
+    hips_missing = not has_hips
+    if not (shoulders_low or torso_flat or torso_horizontal or hips_missing):
+        return None
+
+    face_points = visible_points(keypoint, [0, 1, 2, 3, 4], 0.12)
+    face_x = (
+        sum(point[0] for point in face_points) / len(face_points)
+        if face_points
+        else None
+    )
+    face_y = (
+        sum(point[1] for point in face_points) / len(face_points)
+        if face_points
+        else None
+    )
+
+    if has_hips and torso_horizontal:
+        pad_left = pw * 0.10
+        pad_right = pw * 0.05
+        if face_x is not None and face_x < min_x:
+            pad_left, pad_right = pad_right, pad_left
+        x1 = min_x - pad_left
+        x2 = max_x + pad_right
+        y1 = min_y - ph * 0.32
+        y2 = max_y + ph * 0.12
+    elif hips_missing:
+        shoulder_span = max(max_x - min_x, pw * 0.28)
+        x1 = min_x - shoulder_span * 0.35
+        x2 = max_x + shoulder_span * 0.18
+        if face_x is not None and face_x > max_x:
+            x2 = min(x2, max_x + shoulder_span * 0.25)
+        elif face_x is not None and face_x < min_x:
+            x1 = max(x1, min_x - shoulder_span * 0.25)
+        y1 = min_y - max(80, ph * 0.28)
+        y2 = max_y + ph * 0.12
+    else:
+        center_x = (min_x + max_x) / 2
+        width = max(max_x - min_x, pw * 0.58)
+        x1 = center_x - width * 0.55
+        x2 = center_x + width * 0.55
+        y1 = min_y - ph * 0.08
+        y2 = min(py + ph * 0.98, max_y + ph * 0.32)
+
+    overlaps_face_x = (
+        face_x is not None and x1 <= face_x <= x2
+    )
+    if overlaps_face_x and face_y is not None and y1 < face_y + ph * 0.04:
+        y1 = max(y1, face_y + ph * 0.04)
+
+    x1 = max(px, x1)
+    y1 = max(py, y1)
+    x2 = min(px + pw, x2)
+    y2 = min(py + ph, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [x1, y1, x2 - x1, y2 - y1]
+
+
 def constrain_sensitive_box(box, class_name, people_bounds):
     """Clip a detected sensitive box to plausible torso/pelvis limits."""
     x, y, width, height = [float(value) for value in box]
+    if class_name == "BREAST_FALLBACK":
+        return [x, y, width, height]
+
     center_x, center_y = x + width / 2, y + height / 2
     matching_people = []
     for bounds in people_bounds:
