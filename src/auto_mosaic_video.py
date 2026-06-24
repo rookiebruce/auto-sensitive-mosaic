@@ -23,6 +23,8 @@ TARGET_CLASSES = {
     "BUTTOCKS_COVERED",
 }
 
+ERAX_TARGET_CLASSES = {"nipple", "vagina", "penis", "anus"}
+
 
 def iou(a, b):
     ax1, ay1, aw, ah = a
@@ -105,6 +107,37 @@ def merge_nudenet_detections(detector, frame, threshold=0.10):
                     "box": [x, y, width, height],
                 }
             )
+    return detections
+
+
+def erax_sensitive_detections(model, frame, threshold=0.05):
+    """Detect small sensitive parts with a dedicated YOLO model."""
+    if model is None:
+        return []
+
+    detections = []
+    result = model.predict(
+        frame, imgsz=960, conf=threshold, iou=0.45, verbose=False
+    )[0]
+    if result.boxes is None:
+        return detections
+
+    for box in result.boxes:
+        class_id = int(box.cls.item())
+        class_name = model.names[class_id]
+        if class_name not in ERAX_TARGET_CLASSES:
+            continue
+        x1, y1, x2, y2 = [float(value) for value in box.xyxy[0].cpu().numpy()]
+        width, height = x2 - x1, y2 - y1
+        if width <= 1 or height <= 1:
+            continue
+        detections.append(
+            {
+                "class": f"ERAX_{class_name.upper()}",
+                "score": float(box.conf.item()),
+                "box": [x1, y1, width, height],
+            }
+        )
     return detections
 
 
@@ -348,7 +381,7 @@ def abnormal_pose_breast_box(keypoint, px, py, pw, ph):
 def constrain_sensitive_box(box, class_name, people_bounds):
     """Clip a detected sensitive box to plausible torso/pelvis limits."""
     x, y, width, height = [float(value) for value in box]
-    if class_name == "BREAST_FALLBACK":
+    if class_name == "BREAST_FALLBACK" or class_name.startswith("ERAX_"):
         return [x, y, width, height]
 
     center_x, center_y = x + width / 2, y + height / 2
@@ -368,7 +401,7 @@ def constrain_sensitive_box(box, class_name, people_bounds):
 
     if "BREAST" in class_name:
         min_y = bounds["shoulder_line"] + ph * 0.02
-        max_y = bounds["hip_line"] - ph * 0.06
+        max_y = py + ph * 0.99
     else:
         min_y = bounds["hip_line"] - ph * 0.10
         max_y = py + ph * 0.96
@@ -404,7 +437,7 @@ def mosaic_region(frame, box, block_size=34, padding_ratio=0.10):
     )
 
 
-def process_video(input_path, output_path, ffmpeg_path, pose_model_path):
+def process_video(input_path, output_path, ffmpeg_path, pose_model_path, part_model_path=None):
     capture = cv2.VideoCapture(input_path)
     if not capture.isOpened():
         raise RuntimeError(f"Cannot open input video: {input_path}")
@@ -415,6 +448,7 @@ def process_video(input_path, output_path, ffmpeg_path, pose_model_path):
     total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     detector = NudeDetector()
     pose_model = YOLO(pose_model_path)
+    part_model = YOLO(part_model_path) if part_model_path else None
 
     command = [
         ffmpeg_path,
@@ -465,6 +499,7 @@ def process_video(input_path, output_path, ffmpeg_path, pose_model_path):
                 break
 
             detections = merge_nudenet_detections(detector, frame)
+            detections.extend(erax_sensitive_detections(part_model, frame))
             guardrails = pose_guardrails(pose_model, frame)
             detections.extend(pose_safety_detections(guardrails))
             tracks = update_tracks(tracks, detections)
@@ -473,7 +508,10 @@ def process_video(input_path, output_path, ffmpeg_path, pose_model_path):
                     track["box"], track["class"], guardrails
                 )
                 if box is not None:
-                    mosaic_region(frame, box)
+                    if track["class"].startswith("ERAX_"):
+                        mosaic_region(frame, box, block_size=28, padding_ratio=0.04)
+                    else:
+                        mosaic_region(frame, box)
 
             encoder.stdin.write(frame.tobytes())
             frame_index += 1
@@ -502,6 +540,7 @@ def main():
     parser.add_argument("output")
     parser.add_argument("--ffmpeg", required=True)
     parser.add_argument("--pose-model", required=True)
+    parser.add_argument("--part-model")
     arguments = parser.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(arguments.output)), exist_ok=True)
@@ -510,6 +549,7 @@ def main():
         arguments.output,
         arguments.ffmpeg,
         arguments.pose_model,
+        arguments.part_model,
     )
 
 

@@ -1,6 +1,6 @@
 # FrameShield：自动视频隐私马赛克
 
-一个本地运行的视频隐私处理工具。它逐帧识别高风险人体敏感区域，对候选区域施加重度像素化；同时使用人体姿态作为“护栏”和小范围安全兜底，把遮挡限制在合理的躯干/骨盆范围内，避免把脸部一起打码。
+一个本地运行的视频隐私处理工具。它逐帧识别高风险人体敏感区域，对候选区域施加重度像素化；同时融合精细部位检测、裸露区域检测和人体姿态护栏，尽量只覆盖敏感部位，减少对整体画面观感的影响。
 
 > [!WARNING]
 > 本项目涉及敏感内容识别。下方“处理前”示例也已经做了整帧安全像素化，仓库不包含原视频、未遮挡帧、处理成片、API 密钥或模型权重。
@@ -16,6 +16,7 @@
 ## 功能作用
 
 - 对视频每一帧运行敏感区域检测。
+- 使用 EraX YOLO 精细检测 `nipple / vagina / penis / anus` 等小目标，优先打小框。
 - 同时检测原帧和水平翻转帧，减少姿态与方向导致的漏检。
 - 使用跨帧跟踪和平滑，降低马赛克闪烁。
 - 使用 YOLO Pose 估计人体范围、肩线和髋线，并在胸部/骨盆位置生成安全兜底框。
@@ -31,8 +32,10 @@
 flowchart LR
     A["读取视频帧"] --> B["原帧敏感区域检测"]
     A --> C["水平翻转帧检测"]
+    A --> P["EraX 小目标检测"]
     B --> D["坐标合并"]
     C --> D
+    P --> D
     D --> E["跨帧匹配与轨迹平滑"]
     A --> F["人体姿态检测"]
     F --> G["生成肩线、髋线、人体边界"]
@@ -46,6 +49,10 @@ flowchart LR
 ### 1. 双向敏感区域检测
 
 每帧分别输入原图和水平翻转图。翻转图检测结果会映射回原坐标系，再与原图结果合并。默认检测阈值为 `0.10`，优先降低漏检概率。
+
+### 1.1 精细部位检测
+
+可选加载 EraX NSFW YOLO 权重，通过 `--part-model` 指定。它直接检测 `nipple / vagina / penis / anus` 等小目标，命中后优先使用更小的遮挡框，适合修复乳头、阴部等细粒度漏检。
 
 ### 2. 跨帧跟踪
 
@@ -94,7 +101,8 @@ pip install -r requirements.txt
 ```bash
 python src/auto_mosaic_video.py input.mp4 output.mp4 \
   --ffmpeg /path/to/ffmpeg \
-  --pose-model /path/to/yolo11n-pose.pt
+  --pose-model /path/to/yolo11n-pose.pt \
+  --part-model /path/to/erax_nsfw_yolo11n.pt
 ```
 
 Windows 示例：
@@ -102,7 +110,8 @@ Windows 示例：
 ```powershell
 python src\auto_mosaic_video.py input.mp4 output.mp4 `
   --ffmpeg C:\ffmpeg\bin\ffmpeg.exe `
-  --pose-model .\yolo11n-pose.pt
+  --pose-model .\yolo11n-pose.pt `
+  --part-model .\erax_nsfw_yolo11n.pt
 ```
 
 ## 关键参数
@@ -112,6 +121,7 @@ python src\auto_mosaic_video.py input.mp4 output.mp4 `
 | 敏感检测阈值 | `0.10` | 越低越不容易漏检，但误遮挡增加 |
 | 轨迹保留 | `8` 帧 | 减少短暂漏检造成的闪烁 |
 | 姿态置信度 | `0.12` | 控制人体姿态护栏的敏感度 |
+| EraX 检测阈值 | `0.05` | 精细检测 nipple / genitalia 等小目标 |
 | 边界扩张 | `10%` | 防止只遮住检测框中心 |
 | 马赛克块 | `34 px` | 数值越大，遮挡越强 |
 | H.264 CRF | `18` | 控制输出画质与体积 |
@@ -133,6 +143,7 @@ python src\auto_mosaic_video.py input.mp4 output.mp4 `
 核心函数：
 
 - `merge_nudenet_detections()`：运行原帧与翻转帧检测并合并坐标。
+- `erax_sensitive_detections()`：使用 EraX YOLO 检测 nipple、vagina、penis、anus 等小目标。
 - `update_tracks()`：匹配、平滑并短期保留候选轨迹。
 - `pose_guardrails()`：根据人体姿态生成肩线、髋线和人体边界。
 - `pose_safety_detections()`：在胸部和骨盆位置生成小范围兜底遮挡框。
